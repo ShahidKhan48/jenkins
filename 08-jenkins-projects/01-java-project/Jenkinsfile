@@ -1,0 +1,174 @@
+pipeline {
+    agent any
+    
+    tools {
+        maven 'Maven-3.8.6'
+        jdk 'JDK-11'
+    }
+    
+    environment {
+        IMAGE_NAME = 'company/java-app'
+        SONAR_PROJECT_KEY = 'java-microservice'
+    }
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target deployment environment'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip unit tests'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'mvn clean compile'
+            }
+        }
+        
+        stage('Test') {
+            when {
+                not { params.SKIP_TESTS }
+            }
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh "chmod +x scripts/test-runner.sh"
+                        sh "scripts/test-runner.sh unit java"
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                            publishCoverage adapters: [jacocoAdapter('target/site/jacoco/jacoco.xml')]
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        sh 'mvn verify -Dskip.unit.tests=true'
+                    }
+                }
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh """
+                                mvn sonar:sonar \
+                                -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                -Dsonar.host.url=${SONAR_HOST_URL} \
+                                -Dsonar.login=${SONAR_AUTH_TOKEN}
+                            """
+                        }
+                    }
+                }
+                stage('Security Scan') {
+                    steps {
+                        sh 'mvn org.owasp:dependency-check-maven:check'
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target',
+                            reportFiles: 'dependency-check-report.html',
+                            reportName: 'OWASP Dependency Check'
+                        ])
+                    }
+                }
+            }
+        }
+        
+        stage('Package') {
+            steps {
+                sh 'mvn package -DskipTests'
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    sh "chmod +x scripts/build-and-push.sh"
+                    sh "scripts/build-and-push.sh ${IMAGE_NAME} ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    def deployEnv = params.ENVIRONMENT ?: (env.BRANCH_NAME == 'main' ? 'prod' : 'dev')
+                    
+                    build job: 'deploy-java-app',
+                        parameters: [
+                            string(name: 'IMAGE_TAG', value: env.GIT_COMMIT_SHORT),
+                            string(name: 'ENVIRONMENT', value: deployEnv)
+                        ],
+                        wait: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            emailext (
+                subject: "✅ Build Success: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                    Build completed successfully!
+                    
+                    Project: ${env.JOB_NAME}
+                    Build: ${env.BUILD_NUMBER}
+                    Commit: ${env.GIT_COMMIT_SHORT}
+                    Environment: ${params.ENVIRONMENT}
+                    
+                    View build: ${env.BUILD_URL}
+                """,
+                to: "${env.CHANGE_AUTHOR_EMAIL}, devops@company.com"
+            )
+        }
+        failure {
+            emailext (
+                subject: "❌ Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                    Build failed!
+                    
+                    Project: ${env.JOB_NAME}
+                    Build: ${env.BUILD_NUMBER}
+                    
+                    Check logs: ${env.BUILD_URL}console
+                """,
+                to: "${env.CHANGE_AUTHOR_EMAIL}, devops@company.com"
+            )
+        }
+    }
+}

@@ -1,0 +1,287 @@
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-u root:root'
+        }
+    }
+    
+    environment {
+        PYTHONPATH = "${WORKSPACE}"
+        PYTHONDONTWRITEBYTECODE = '1'
+        PYTHONUNBUFFERED = '1'
+        IMAGE_NAME = 'company/python-api'
+    }
+    
+    parameters {
+        choice(
+            name: 'PYTHON_VERSION',
+            choices: ['3.11', '3.10', '3.9'],
+            description: 'Python version for testing'
+        )
+        booleanParam(
+            name: 'DEPLOY_TO_STAGING',
+            defaultValue: false,
+            description: 'Deploy to staging environment'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.APP_VERSION = sh(
+                        script: "python setup.py --version",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Setup Environment') {
+            steps {
+                sh '''
+                    python -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install -r requirements-dev.txt
+                '''
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('Linting') {
+                    steps {
+                        sh '''
+                            . venv/bin/activate
+                            flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+                            pylint src/ --rcfile=.pylintrc
+                        '''
+                    }
+                }
+                stage('Type Checking') {
+                    steps {
+                        sh '''
+                            . venv/bin/activate
+                            mypy src/ --config-file=mypy.ini
+                        '''
+                    }
+                }
+                stage('Security Check') {
+                    steps {
+                        sh '''
+                            . venv/bin/activate
+                            bandit -r src/ -f json -o bandit-report.json
+                            safety check --json --output safety-report.json
+                        '''
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: '.',
+                            reportFiles: 'bandit-report.json',
+                            reportName: 'Bandit Security Report'
+                        ])
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh '''
+                            . venv/bin/activate
+                            chmod +x scripts/test-runner.sh
+                            scripts/test-runner.sh unit python
+                        '''
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'pytest-unit.xml'
+                            publishCoverage adapters: [
+                                coberturaAdapter('coverage.xml')
+                            ]
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        sh '''
+                            . venv/bin/activate
+                            pytest tests/integration/ \
+                                --junit-xml=pytest-integration.xml \
+                                -v
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Build Package') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    python setup.py sdist bdist_wheel
+                '''
+                archiveArtifacts artifacts: 'dist/*', fingerprint: true
+            }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'gcp-service-account', variable: 'GCP_KEY')]) {
+                        sh '''
+                            gcloud auth activate-service-account --key-file=$GCP_KEY
+                            gcloud auth configure-docker
+                        '''
+                        
+                        sh "chmod +x scripts/build-and-push.sh"
+                        sh "scripts/build-and-push.sh ${IMAGE_NAME} ${env.APP_VERSION}"
+                    }
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    docker.image("${DOCKER_REGISTRY}/${GCP_PROJECT}/${IMAGE_NAME}:${env.APP_VERSION}")
+                        .withRun('-p 8000:8000 -e ENVIRONMENT=test') { container ->
+                        
+                        sh 'sleep 15' // Wait for app to start
+                        
+                        sh '''
+                            . venv/bin/activate
+                            locust --headless \
+                                --users 50 \
+                                --spawn-rate 5 \
+                                --run-time 2m \
+                                --host http://localhost:8000 \
+                                --html performance-report.html
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'performance-report.html',
+                        reportName: 'Performance Test Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                anyOf {
+                    expression { params.DEPLOY_TO_STAGING }
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    build job: 'deploy-python-api',
+                        parameters: [
+                            string(name: 'IMAGE_TAG', value: env.APP_VERSION),
+                            string(name: 'ENVIRONMENT', value: 'staging'),
+                            string(name: 'REPLICAS', value: '2')
+                        ],
+                        wait: true
+                }
+            }
+        }
+        
+        stage('Production Deployment') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { 
+                        return currentBuild.result == null || currentBuild.result == 'SUCCESS' 
+                    }
+                }
+            }
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'deploy-prod',
+                        message: 'Deploy to Production?',
+                        parameters: [
+                            choice(
+                                name: 'DEPLOYMENT_STRATEGY',
+                                choices: ['rolling', 'blue-green', 'canary'],
+                                description: 'Deployment strategy'
+                            )
+                        ]
+                    )
+                    
+                    build job: 'deploy-python-api',
+                        parameters: [
+                            string(name: 'IMAGE_TAG', value: env.APP_VERSION),
+                            string(name: 'ENVIRONMENT', value: 'production'),
+                            string(name: 'STRATEGY', value: userInput.DEPLOYMENT_STRATEGY),
+                            string(name: 'REPLICAS', value: '5')
+                        ],
+                        wait: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    emailext (
+                        subject: "🐍 Python API v${env.APP_VERSION} - Production Ready",
+                        body: """
+                            Python API build completed successfully!
+                            
+                            Version: ${env.APP_VERSION}
+                            Build: ${env.BUILD_NUMBER}
+                            
+                            All tests passed ✅
+                            Security scans clean ✅
+                            Performance tests passed ✅
+                            
+                            Ready for production deployment.
+                            
+                            Build Details: ${env.BUILD_URL}
+                        """,
+                        to: "devops@company.com, product@company.com"
+                    )
+                }
+            }
+        }
+        failure {
+            emailext (
+                subject: "🚨 Python API Build Failed - ${env.BUILD_NUMBER}",
+                body: """
+                    Python API build failed!
+                    
+                    Branch: ${env.BRANCH_NAME}
+                    Build: ${env.BUILD_NUMBER}
+                    
+                    Please check the build logs: ${env.BUILD_URL}console
+                """,
+                to: "${env.CHANGE_AUTHOR_EMAIL}, devops@company.com"
+            )
+        }
+    }
+}

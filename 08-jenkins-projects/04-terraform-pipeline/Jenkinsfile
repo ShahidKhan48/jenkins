@@ -1,0 +1,358 @@
+pipeline {
+    agent any
+    
+    tools {
+        terraform 'Terraform-1.5.0'
+    }
+    
+    environment {
+        TF_VAR_environment = "${params.ENVIRONMENT}"
+        TF_VAR_region = "${params.AWS_REGION}"
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+    }
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform action to perform'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target environment'
+        )
+        choice(
+            name: 'AWS_REGION',
+            choices: ['us-west-2', 'us-east-1', 'eu-west-1'],
+            description: 'AWS region'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto-approve terraform apply (use with caution)'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.TF_WORKSPACE = params.ENVIRONMENT
+                    env.STATE_BUCKET = "terraform-state-${params.ENVIRONMENT}-${params.AWS_REGION}"
+                }
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', 
+                     credentialsId: 'aws-terraform-credentials']
+                ]) {
+                    sh '''
+                        cd terraform/
+                        terraform init \
+                            -backend-config="bucket=${STATE_BUCKET}" \
+                            -backend-config="key=${ENVIRONMENT}/terraform.tfstate" \
+                            -backend-config="region=${AWS_REGION}"
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Workspace') {
+            steps {
+                sh '''
+                    cd terraform/
+                    terraform workspace select ${ENVIRONMENT} || terraform workspace new ${ENVIRONMENT}
+                '''
+            }
+        }
+        
+        stage('Terraform Validate') {
+            steps {
+                sh '''
+                    cd terraform/
+                    terraform validate
+                    terraform fmt -check=true -diff=true
+                '''
+            }
+        }
+        
+        stage('Security Scan') {
+            parallel {
+                stage('Checkov Scan') {
+                    steps {
+                        sh '''
+                            checkov -d terraform/ \
+                                --framework terraform \
+                                --output junitxml \
+                                --output-file-path checkov-report.xml
+                        '''
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'checkov-report.xml'
+                        }
+                    }
+                }
+                stage('TFSec Scan') {
+                    steps {
+                        sh '''
+                            tfsec terraform/ \
+                                --format junit \
+                                --out tfsec-report.xml
+                        '''
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'tfsec-report.xml'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', 
+                     credentialsId: 'aws-terraform-credentials']
+                ]) {
+                    sh '''
+                        cd terraform/
+                        terraform plan \
+                            -var-file="environments/${ENVIRONMENT}.tfvars" \
+                            -out=tfplan \
+                            -detailed-exitcode
+                    '''
+                }
+                
+                // Archive the plan
+                archiveArtifacts artifacts: 'terraform/tfplan', fingerprint: true
+                
+                // Generate and publish plan summary
+                sh '''
+                    cd terraform/
+                    terraform show -json tfplan > tfplan.json
+                    terraform show tfplan > tfplan.txt
+                '''
+                
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'terraform',
+                    reportFiles: 'tfplan.txt',
+                    reportName: 'Terraform Plan'
+                ])
+            }
+        }
+        
+        stage('Cost Estimation') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    try {
+                        sh '''
+                            cd terraform/
+                            infracost breakdown \
+                                --path tfplan.json \
+                                --format json \
+                                --out-file infracost.json
+                            
+                            infracost output \
+                                --path infracost.json \
+                                --format html \
+                                --out-file cost-estimate.html
+                        '''
+                        
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'terraform',
+                            reportFiles: 'cost-estimate.html',
+                            reportName: 'Cost Estimation'
+                        ])
+                    } catch (Exception e) {
+                        echo "Cost estimation failed: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+        
+        stage('Approval') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'apply' || params.ACTION == 'destroy' }
+                    not { params.AUTO_APPROVE }
+                }
+            }
+            steps {
+                script {
+                    def action = params.ACTION.toUpperCase()
+                    def approvers = params.ENVIRONMENT == 'prod' ? 
+                        'devops-leads,platform-team' : 'devops-team'
+                    
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: "Approve Terraform ${action} for ${params.ENVIRONMENT}?",
+                            ok: "Proceed with ${action}",
+                            submitterParameter: 'APPROVER',
+                            submitter: approvers
+                        )
+                    }
+                    
+                    echo "Terraform ${action} approved by: ${env.APPROVER}"
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', 
+                     credentialsId: 'aws-terraform-credentials']
+                ]) {
+                    sh '''
+                        cd terraform/
+                        terraform apply tfplan
+                    '''
+                }
+            }
+            post {
+                success {
+                    sh '''
+                        cd terraform/
+                        terraform output -json > terraform-outputs.json
+                    '''
+                    archiveArtifacts artifacts: 'terraform/terraform-outputs.json'
+                }
+            }
+        }
+        
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', 
+                     credentialsId: 'aws-terraform-credentials']
+                ]) {
+                    sh '''
+                        cd terraform/
+                        terraform destroy \
+                            -var-file="environments/${ENVIRONMENT}.tfvars" \
+                            -auto-approve
+                    '''
+                }
+            }
+        }
+        
+        stage('Compliance Check') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    // Wait for resources to be created
+                    sleep(time: 60, unit: 'SECONDS')
+                    
+                    sh '''
+                        # Run compliance checks
+                        aws-compliance-checker \
+                            --region ${AWS_REGION} \
+                            --environment ${ENVIRONMENT} \
+                            --output compliance-report.json
+                    '''
+                    
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'compliance-report.json',
+                        reportName: 'Compliance Report'
+                    ])
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up sensitive files
+            sh '''
+                find . -name "*.tfstate*" -delete
+                find . -name "terraform.tfvars" -delete
+            '''
+            cleanWs()
+        }
+        success {
+            script {
+                def action = params.ACTION.toUpperCase()
+                def message = """
+                    ✅ *Terraform ${action} Successful*
+                    
+                    Environment: `${params.ENVIRONMENT}`
+                    Region: `${params.AWS_REGION}`
+                    Build: #${env.BUILD_NUMBER}
+                    
+                    <${env.BUILD_URL}|View Build Details>
+                """
+                
+                slackSend(
+                    channel: '#infrastructure',
+                    color: 'good',
+                    message: message
+                )
+                
+                if (params.ACTION == 'apply') {
+                    emailext (
+                        subject: "🏗️ Infrastructure Updated - ${params.ENVIRONMENT}",
+                        body: """
+                            Terraform apply completed successfully!
+                            
+                            Environment: ${params.ENVIRONMENT}
+                            Region: ${params.AWS_REGION}
+                            Approved by: ${env.APPROVER ?: 'Auto-approved'}
+                            
+                            Build Details: ${env.BUILD_URL}
+                            Terraform Outputs: ${env.BUILD_URL}artifact/terraform/terraform-outputs.json
+                        """,
+                        to: "devops@company.com, platform@company.com"
+                    )
+                }
+            }
+        }
+        failure {
+            script {
+                def action = params.ACTION.toUpperCase()
+                slackSend(
+                    channel: '#alerts',
+                    color: 'danger',
+                    message: """
+                        ❌ *Terraform ${action} Failed*
+                        
+                        Environment: `${params.ENVIRONMENT}`
+                        Region: `${params.AWS_REGION}`
+                        Build: #${env.BUILD_NUMBER}
+                        
+                        <${env.BUILD_URL}console|View Logs>
+                    """
+                )
+            }
+        }
+    }
+}

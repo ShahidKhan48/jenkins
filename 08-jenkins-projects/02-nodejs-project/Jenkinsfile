@@ -1,0 +1,207 @@
+pipeline {
+    agent {
+        docker {
+            image 'node:18-alpine'
+            args '-u root:root'
+        }
+    }
+    
+    environment {
+        NODE_ENV = 'production'
+        IMAGE_NAME = 'company/nodejs-app'
+        SONAR_SCANNER_VERSION = '4.8.0'
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Deployment environment'
+        )
+        booleanParam(
+            name: 'RUN_E2E_TESTS',
+            defaultValue: true,
+            description: 'Run end-to-end tests'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.PACKAGE_VERSION = sh(
+                        script: "node -p \"require('./package.json').version\"",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm ci --only=production'
+                sh 'npm ci --only=development'
+            }
+        }
+        
+        stage('Lint & Format') {
+            parallel {
+                stage('ESLint') {
+                    steps {
+                        sh 'npm run lint'
+                    }
+                }
+                stage('Prettier Check') {
+                    steps {
+                        sh 'npm run format:check'
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh "chmod +x scripts/test-runner.sh"
+                        sh "scripts/test-runner.sh unit nodejs"
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'coverage/junit.xml'
+                            publishCoverage adapters: [
+                                istanbulCoberturaAdapter('coverage/cobertura-coverage.xml')
+                            ]
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        sh 'npm run test:integration'
+                    }
+                }
+            }
+        }
+        
+        stage('Security & Quality') {
+            parallel {
+                stage('Security Audit') {
+                    steps {
+                        sh 'npm audit --audit-level=high'
+                        sh 'npx retire --exitwith 1'
+                    }
+                }
+                stage('SonarQube Analysis') {
+                    steps {
+                        script {
+                            def scannerHome = tool 'SonarScanner'
+                            withSonarQubeEnv('SonarQube') {
+                                sh """
+                                    ${scannerHome}/bin/sonar-scanner \
+                                    -Dsonar.projectKey=nodejs-app \
+                                    -Dsonar.sources=src \
+                                    -Dsonar.tests=tests \
+                                    -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                                    -Dsonar.testExecutionReportPaths=coverage/test-reporter.xml
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'npm run build'
+                archiveArtifacts artifacts: 'dist/**/*', fingerprint: true
+            }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    sh "chmod +x scripts/build-and-push.sh"
+                    sh "scripts/build-and-push.sh ${IMAGE_NAME} ${env.PACKAGE_VERSION}"
+                }
+            }
+        }
+        
+        stage('E2E Tests') {
+            when {
+                expression { params.RUN_E2E_TESTS }
+            }
+            steps {
+                script {
+                    docker.image("${IMAGE_NAME}:${env.PACKAGE_VERSION}").withRun('-p 3000:3000') { container ->
+                        sh 'sleep 10' // Wait for app to start
+                        sh 'npm run test:e2e'
+                    }
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'cypress/reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Cypress E2E Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    def targetEnv = params.DEPLOY_ENV ?: (env.BRANCH_NAME == 'main' ? 'prod' : 'dev')
+                    
+                    build job: 'deploy-nodejs-app',
+                        parameters: [
+                            string(name: 'IMAGE_TAG', value: env.PACKAGE_VERSION),
+                            string(name: 'ENVIRONMENT', value: targetEnv)
+                        ],
+                        wait: false
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: """
+                    ✅ *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER} succeeded
+                    Version: ${env.PACKAGE_VERSION}
+                    Branch: ${env.BRANCH_NAME}
+                    <${env.BUILD_URL}|View Build>
+                """
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#alerts',
+                color: 'danger',
+                message: """
+                    ❌ *${env.JOB_NAME}* - Build #${env.BUILD_NUMBER} failed
+                    Branch: ${env.BRANCH_NAME}
+                    <${env.BUILD_URL}console|View Logs>
+                """
+            )
+        }
+    }
+}

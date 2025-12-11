@@ -1,0 +1,409 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: bitnami/kubectl:latest
+    command:
+    - sleep
+    args:
+    - 99d
+  - name: helm
+    image: alpine/helm:latest
+    command:
+    - sleep
+    args:
+    - 99d
+  - name: docker
+    image: docker:dind
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'harbor.company.com'
+        HELM_CHART_PATH = 'helm/microservice'
+        KUBECONFIG_DEV = credentials('kubeconfig-dev')
+        KUBECONFIG_STAGING = credentials('kubeconfig-staging')
+        KUBECONFIG_PROD = credentials('kubeconfig-prod')
+    }
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target Kubernetes environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to deploy'
+        )
+        choice(
+            name: 'DEPLOYMENT_STRATEGY',
+            choices: ['rolling', 'blue-green', 'canary'],
+            description: 'Deployment strategy'
+        )
+        string(
+            name: 'REPLICAS',
+            defaultValue: '3',
+            description: 'Number of replicas'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.NAMESPACE = "app-${params.ENVIRONMENT}"
+                    env.RELEASE_NAME = "microservice-${params.ENVIRONMENT}"
+                    env.KUBECONFIG_CRED = "KUBECONFIG_${params.ENVIRONMENT.toUpperCase()}"
+                }
+            }
+        }
+        
+        stage('Validate Manifests') {
+            steps {
+                container('kubectl') {
+                    script {
+                        withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                            sh '''
+                                # Validate Kubernetes manifests
+                                find k8s/ -name "*.yaml" -o -name "*.yml" | while read file; do
+                                    echo "Validating $file"
+                                    kubectl apply --dry-run=client -f "$file"
+                                done
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Helm Lint & Template') {
+            steps {
+                container('helm') {
+                    sh '''
+                        # Lint Helm chart
+                        helm lint ${HELM_CHART_PATH}
+                        
+                        # Template and validate
+                        helm template ${RELEASE_NAME} ${HELM_CHART_PATH} \
+                            --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                            --set image.tag=${IMAGE_TAG} \
+                            --set replicaCount=${REPLICAS} \
+                            --namespace ${NAMESPACE} > templated-manifests.yaml
+                    '''
+                    
+                    archiveArtifacts artifacts: 'templated-manifests.yaml'
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            parallel {
+                stage('Kubesec Scan') {
+                    steps {
+                        container('kubectl') {
+                            sh '''
+                                # Install kubesec
+                                wget -O kubesec https://github.com/controlplaneio/kubesec/releases/latest/download/kubesec_linux_amd64
+                                chmod +x kubesec
+                                
+                                # Scan manifests
+                                ./kubesec scan templated-manifests.yaml > kubesec-report.json
+                            '''
+                            
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: '.',
+                                reportFiles: 'kubesec-report.json',
+                                reportName: 'Kubesec Security Report'
+                            ])
+                        }
+                    }
+                }
+                stage('OPA Policy Check') {
+                    steps {
+                        container('kubectl') {
+                            script {
+                                try {
+                                    sh '''
+                                        # Install OPA
+                                        wget -O opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+                                        chmod +x opa
+                                        
+                                        # Run policy checks
+                                        ./opa test policies/ templated-manifests.yaml
+                                    '''
+                                } catch (Exception e) {
+                                    echo "OPA policy check failed: ${e.getMessage()}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Pre-deployment Tests') {
+            steps {
+                container('kubectl') {
+                    script {
+                        withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                            sh '''
+                                # Check cluster connectivity
+                                kubectl cluster-info
+                                
+                                # Check namespace exists
+                                kubectl get namespace ${NAMESPACE} || kubectl create namespace ${NAMESPACE}
+                                
+                                # Check resource quotas
+                                kubectl describe resourcequota -n ${NAMESPACE} || true
+                                
+                                # Check node resources
+                                kubectl top nodes
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                container('helm') {
+                    script {
+                        withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                            
+                            if (params.DEPLOYMENT_STRATEGY == 'blue-green') {
+                                // Blue-Green Deployment
+                                sh '''
+                                    # Deploy to green environment
+                                    helm upgrade --install ${RELEASE_NAME}-green ${HELM_CHART_PATH} \
+                                        --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                                        --set image.tag=${IMAGE_TAG} \
+                                        --set replicaCount=${REPLICAS} \
+                                        --set service.selector.version=green \
+                                        --namespace ${NAMESPACE} \
+                                        --wait --timeout=10m
+                                '''
+                                
+                                // Health check
+                                sh '''
+                                    kubectl wait --for=condition=ready pod \
+                                        -l app.kubernetes.io/instance=${RELEASE_NAME}-green \
+                                        -n ${NAMESPACE} \
+                                        --timeout=300s
+                                '''
+                                
+                                // Switch traffic
+                                input(
+                                    message: 'Switch traffic to green deployment?',
+                                    ok: 'Switch Traffic'
+                                )
+                                
+                                sh '''
+                                    # Update service to point to green
+                                    kubectl patch service ${RELEASE_NAME} \
+                                        -n ${NAMESPACE} \
+                                        -p '{"spec":{"selector":{"version":"green"}}}'
+                                    
+                                    # Remove blue deployment
+                                    helm uninstall ${RELEASE_NAME}-blue -n ${NAMESPACE} || true
+                                    
+                                    # Rename green to main
+                                    helm upgrade ${RELEASE_NAME} ${HELM_CHART_PATH} \
+                                        --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                                        --set image.tag=${IMAGE_TAG} \
+                                        --set replicaCount=${REPLICAS} \
+                                        --namespace ${NAMESPACE}
+                                '''
+                                
+                            } else if (params.DEPLOYMENT_STRATEGY == 'canary') {
+                                // Canary Deployment
+                                sh '''
+                                    # Deploy canary with 10% traffic
+                                    helm upgrade --install ${RELEASE_NAME}-canary ${HELM_CHART_PATH} \
+                                        --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                                        --set image.tag=${IMAGE_TAG} \
+                                        --set replicaCount=1 \
+                                        --set service.weight=10 \
+                                        --namespace ${NAMESPACE} \
+                                        --wait --timeout=10m
+                                '''
+                                
+                                // Monitor canary
+                                sleep(time: 300, unit: 'SECONDS') // 5 minutes
+                                
+                                // Check metrics and promote
+                                def promoteCanary = input(
+                                    message: 'Promote canary to full deployment?',
+                                    ok: 'Promote',
+                                    parameters: [
+                                        booleanParam(
+                                            name: 'PROMOTE',
+                                            defaultValue: true,
+                                            description: 'Promote canary'
+                                        )
+                                    ]
+                                )
+                                
+                                if (promoteCanary.PROMOTE) {
+                                    sh '''
+                                        # Promote canary to full deployment
+                                        helm upgrade ${RELEASE_NAME} ${HELM_CHART_PATH} \
+                                            --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                                            --set image.tag=${IMAGE_TAG} \
+                                            --set replicaCount=${REPLICAS} \
+                                            --namespace ${NAMESPACE}
+                                        
+                                        # Remove canary
+                                        helm uninstall ${RELEASE_NAME}-canary -n ${NAMESPACE}
+                                    '''
+                                } else {
+                                    sh '''
+                                        # Rollback canary
+                                        helm uninstall ${RELEASE_NAME}-canary -n ${NAMESPACE}
+                                    '''
+                                    error("Canary deployment rolled back")
+                                }
+                                
+                            } else {
+                                // Rolling Update (default)
+                                sh '''
+                                    helm upgrade --install ${RELEASE_NAME} ${HELM_CHART_PATH} \
+                                        --values ${HELM_CHART_PATH}/values-${ENVIRONMENT}.yaml \
+                                        --set image.tag=${IMAGE_TAG} \
+                                        --set replicaCount=${REPLICAS} \
+                                        --namespace ${NAMESPACE} \
+                                        --wait --timeout=10m
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Post-deployment Tests') {
+            steps {
+                container('kubectl') {
+                    script {
+                        withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                            sh '''
+                                # Wait for deployment to be ready
+                                kubectl rollout status deployment/${RELEASE_NAME} -n ${NAMESPACE} --timeout=600s
+                                
+                                # Check pod health
+                                kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/instance=${RELEASE_NAME}
+                                
+                                # Run health checks
+                                kubectl run health-check-${BUILD_NUMBER} \
+                                    --image=curlimages/curl:latest \
+                                    --rm -i --restart=Never \
+                                    --namespace=${NAMESPACE} \
+                                    -- curl -f http://${RELEASE_NAME}:80/health
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Smoke Tests') {
+            steps {
+                script {
+                    build job: 'smoke-tests',
+                        parameters: [
+                            string(name: 'ENVIRONMENT', value: params.ENVIRONMENT),
+                            string(name: 'SERVICE_URL', value: "http://${env.RELEASE_NAME}.${env.NAMESPACE}.svc.cluster.local")
+                        ],
+                        wait: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            container('kubectl') {
+                script {
+                    withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                        // Collect deployment information
+                        sh '''
+                            kubectl get all -n ${NAMESPACE} -l app.kubernetes.io/instance=${RELEASE_NAME} > deployment-status.txt
+                            kubectl describe deployment ${RELEASE_NAME} -n ${NAMESPACE} >> deployment-status.txt
+                        '''
+                        
+                        archiveArtifacts artifacts: 'deployment-status.txt'
+                    }
+                }
+            }
+        }
+        success {
+            script {
+                def message = """
+                    ✅ *Kubernetes Deployment Successful*
+                    
+                    Environment: `${params.ENVIRONMENT}`
+                    Image: `${params.IMAGE_TAG}`
+                    Strategy: `${params.DEPLOYMENT_STRATEGY}`
+                    Replicas: `${params.REPLICAS}`
+                    
+                    <${env.BUILD_URL}|View Deployment>
+                """
+                
+                slackSend(
+                    channel: '#deployments',
+                    color: 'good',
+                    message: message
+                )
+            }
+        }
+        failure {
+            container('kubectl') {
+                script {
+                    withCredentials([file(credentialsId: env.KUBECONFIG_CRED, variable: 'KUBECONFIG')]) {
+                        // Collect failure information
+                        sh '''
+                            kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' > failure-events.txt
+                            kubectl logs -l app.kubernetes.io/instance=${RELEASE_NAME} -n ${NAMESPACE} --tail=100 > failure-logs.txt
+                        '''
+                        
+                        archiveArtifacts artifacts: 'failure-*.txt'
+                    }
+                }
+            }
+            
+            slackSend(
+                channel: '#alerts',
+                color: 'danger',
+                message: """
+                    ❌ *Kubernetes Deployment Failed*
+                    
+                    Environment: `${params.ENVIRONMENT}`
+                    Image: `${params.IMAGE_TAG}`
+                    
+                    <${env.BUILD_URL}console|View Logs>
+                """
+            )
+        }
+    }
+}
